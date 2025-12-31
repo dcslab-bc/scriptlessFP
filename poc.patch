@@ -1,0 +1,207 @@
+diff --git a/third_party/blink/renderer/core/css/css_computed_style_declaration.cc b/third_party/blink/renderer/core/css/css_computed_style_declaration.cc
+index ff704790efc96..474ca55ffdafd 100644
+--- a/third_party/blink/renderer/core/css/css_computed_style_declaration.cc
++++ b/third_party/blink/renderer/core/css/css_computed_style_declaration.cc
+@@ -24,6 +24,7 @@
+ 
+ #include "third_party/blink/renderer/core/css/css_computed_style_declaration.h"
+ 
++#include "base/logging.h"
+ #include "base/memory/values_equivalent.h"
+ #include "third_party/blink/renderer/core/animation/css/css_animation_data.h"
+ #include "third_party/blink/renderer/core/css/computed_style_css_value_mapping.h"
+@@ -356,6 +357,16 @@ const CSSValue* CSSComputedStyleDeclaration::GetPropertyCSSValue(
+     return nullptr;
+   }
+ 
++  // PoC: Check if this style was affected by privacy-sensitive media queries
++  if (style->AffectedByPrivacySensitiveMediaQuery()) {
++    LOG(WARNING) << "[CSS Fingerprinting PoC] getComputedStyle() called on "
++                 << "element whose style is affected by privacy-sensitive "
++                 << "media query. Property: "
++                 << property_class.GetPropertyNameString().Utf8()
++                 << ", Element tag: "
++                 << styled_element->tagName().Utf8();
++  }
++
+   // Tally property value fetches when there is a running animation with zero
+   // duration.
+   //   1. duration shorthand
+diff --git a/third_party/blink/renderer/core/css/element_rule_collector.h b/third_party/blink/renderer/core/css/element_rule_collector.h
+index cbefec340c345..c0e68574b22fd 100644
+--- a/third_party/blink/renderer/core/css/element_rule_collector.h
++++ b/third_party/blink/renderer/core/css/element_rule_collector.h
+@@ -150,6 +150,8 @@ class CORE_EXPORT ElementRuleCollector {
+   }
+ 
+   const MatchResult& MatchedResult() const;
++  // [PoC] CSS Fingerprinting Defense: Allow setting privacy-sensitive flag
++  MatchResult& MutableMatchedResult() { return result_; }
+   StyleRuleList* MatchedStyleRuleList();
+   RuleIndexList* MatchedCSSRuleList();
+ 
+diff --git a/third_party/blink/renderer/core/css/media_query_evaluator.cc b/third_party/blink/renderer/core/css/media_query_evaluator.cc
+index 8a43e887802fc..f63684e670bf4 100644
+--- a/third_party/blink/renderer/core/css/media_query_evaluator.cc
++++ b/third_party/blink/renderer/core/css/media_query_evaluator.cc
+@@ -1703,6 +1703,20 @@ KleeneValue MediaQueryEvaluator::EvalFeature(
+     result_flags->is_device_dependent =
+         result_flags->is_device_dependent || feature.IsDeviceDependent();
+     result_flags->unit_flags |= feature.GetUnitFlags();
++
++    // [PoC] CSS Fingerprinting Defense: Mark privacy-sensitive media features.
++    // These features can reveal user preferences and are potential
++    // fingerprinting vectors.
++    const String& feature_name = feature.Name();
++    if (feature_name == media_feature_names::kPrefersColorSchemeMediaFeature.GetString() ||
++        feature_name == media_feature_names::kPrefersReducedMotionMediaFeature.GetString() ||
++        feature_name == media_feature_names::kPrefersContrastMediaFeature.GetString() ||
++        feature_name == media_feature_names::kForcedColorsMediaFeature.GetString() ||
++        feature_name == media_feature_names::kPrefersReducedDataMediaFeature.GetString() ||
++        feature_name == media_feature_names::kPrefersReducedTransparencyMediaFeature.GetString() ||
++        feature_name == media_feature_names::kInvertedColorsMediaFeature.GetString()) {
++      result_flags->is_privacy_sensitive = true;
++    }
+   }
+ 
+   return result ? KleeneValue::kTrue : KleeneValue::kFalse;
+diff --git a/third_party/blink/renderer/core/css/resolver/match_result.h b/third_party/blink/renderer/core/css/resolver/match_result.h
+index 04bdb80585194..4dbd3e43249eb 100644
+--- a/third_party/blink/renderer/core/css/resolver/match_result.h
++++ b/third_party/blink/renderer/core/css/resolver/match_result.h
+@@ -188,6 +188,14 @@ class CORE_EXPORT MatchResult {
+     return highlights_depend_on_size_container_queries_;
+   }
+ 
++  // [PoC] CSS Fingerprinting Defense: Track privacy-sensitive media queries.
++  void SetAffectedByPrivacySensitiveMediaQuery() {
++    affected_by_privacy_sensitive_media_query_ = true;
++  }
++  bool AffectedByPrivacySensitiveMediaQuery() const {
++    return affected_by_privacy_sensitive_media_query_;
++  }
++
+   bool HasFlag(MatchFlag flag) const {
+     return flags_ & static_cast<MatchFlags>(flag);
+   }
+@@ -236,6 +244,8 @@ class CORE_EXPORT MatchResult {
+   bool has_non_universal_highlight_pseudo_styles_{false};
+   bool has_non_ua_highlight_pseudo_styles_{false};
+   bool highlights_depend_on_size_container_queries_{false};
++  // [PoC] CSS Fingerprinting Defense
++  bool affected_by_privacy_sensitive_media_query_{false};
+   MatchFlags flags_{0};
+ #if DCHECK_IS_ON()
+   CascadeOrigin last_origin_{CascadeOrigin::kNone};
+diff --git a/third_party/blink/renderer/core/css/resolver/media_query_result.h b/third_party/blink/renderer/core/css/resolver/media_query_result.h
+index 85f80328aaf92..bab6382411f38 100644
+--- a/third_party/blink/renderer/core/css/resolver/media_query_result.h
++++ b/third_party/blink/renderer/core/css/resolver/media_query_result.h
+@@ -56,7 +56,8 @@ struct MediaQueryResultFlags {
+   bool operator==(const MediaQueryResultFlags& o) const {
+     return (unit_flags == o.unit_flags) &&
+            (is_viewport_dependent == o.is_viewport_dependent) &&
+-           (is_device_dependent == o.is_device_dependent);
++           (is_device_dependent == o.is_device_dependent) &&
++           (is_privacy_sensitive == o.is_privacy_sensitive);
+   }
+   bool operator!=(const MediaQueryResultFlags& o) const {
+     return !(*this == o);
+@@ -66,12 +67,14 @@ struct MediaQueryResultFlags {
+     unit_flags |= o.unit_flags;
+     is_viewport_dependent |= o.is_viewport_dependent;
+     is_device_dependent |= o.is_device_dependent;
++    is_privacy_sensitive |= o.is_privacy_sensitive;
+   }
+ 
+   void Clear() {
+     unit_flags = 0;
+     is_viewport_dependent = false;
+     is_device_dependent = false;
++    is_privacy_sensitive = false;
+   }
+ 
+   // Or'ed MediaQueryExpValue::UnitFlags.
+@@ -82,6 +85,10 @@ struct MediaQueryResultFlags {
+   // True if the result is device dependent, for example if the 'device-width'
+   // media feature was used in the evaluation.
+   bool is_device_dependent = false;
++  // [PoC] True if privacy-sensitive media queries (prefers-color-scheme,
++  // prefers-reduced-motion, prefers-contrast, forced-colors, etc.) were
++  // evaluated and affected style computation.
++  bool is_privacy_sensitive = false;
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/core/css/resolver/style_resolver.cc b/third_party/blink/renderer/core/css/resolver/style_resolver.cc
+index 226b617b03965..8d2501cdccba1 100644
+--- a/third_party/blink/renderer/core/css/resolver/style_resolver.cc
++++ b/third_party/blink/renderer/core/css/resolver/style_resolver.cc
+@@ -1008,6 +1008,12 @@ void StyleResolver::MatchAllRules(StyleResolverState& state,
+           false /* isCacheable */);
+     }
+   }
++
++  // [PoC] CSS Fingerprinting Defense: Check if the document has any
++  // privacy-sensitive media queries and propagate to MatchResult.
++  if (GetDocument().GetStyleEngine().GetRuleFeatureSet().HasPrivacySensitiveMediaQueries()) {
++    collector.MutableMatchedResult().SetAffectedByPrivacySensitiveMediaQuery();
++  }
+ }
+ 
+ const ComputedStyle* StyleResolver::StyleForViewport() {
+@@ -1576,6 +1582,10 @@ void StyleResolver::ApplyBaseStyleNoCache(
+   if (match_result.ConditionallyAffectsAnimations()) {
+     state.SetConditionallyAffectsAnimations();
+   }
++  // PoC: Propagate privacy-sensitive media query tainted flag
++  if (match_result.AffectedByPrivacySensitiveMediaQuery()) {
++    state.StyleBuilder().SetAffectedByPrivacySensitiveMediaQuery();
++  }
+   if (!match_result.CustomHighlightNames().empty()) {
+     state.StyleBuilder().SetCustomHighlightNames(
+         match_result.CustomHighlightNames());
+diff --git a/third_party/blink/renderer/core/css/rule_feature_set.h b/third_party/blink/renderer/core/css/rule_feature_set.h
+index 38a513318e2cc..ce5276e0ba7f0 100644
+--- a/third_party/blink/renderer/core/css/rule_feature_set.h
++++ b/third_party/blink/renderer/core/css/rule_feature_set.h
+@@ -147,10 +147,18 @@ class CORE_EXPORT RuleFeatureSet {
+   MediaQueryResultFlags& MutableMediaQueryResultFlags() {
+     return media_query_result_flags_;
+   }
++  const MediaQueryResultFlags& GetMediaQueryResultFlags() const {
++    return media_query_result_flags_;
++  }
+   bool HasMediaQueryResults() const {
+     return media_query_result_flags_.is_viewport_dependent ||
+            media_query_result_flags_.is_device_dependent;
+   }
++  // [PoC] CSS Fingerprinting Defense: Check if any privacy-sensitive media
++  // queries were evaluated.
++  bool HasPrivacySensitiveMediaQueries() const {
++    return media_query_result_flags_.is_privacy_sensitive;
++  }
+   bool HasViewportDependentMediaQueries() const;
+   bool HasDynamicViewportDependentMediaQueries() const;
+ 
+diff --git a/third_party/blink/renderer/core/style/computed_style_extra_fields.json5 b/third_party/blink/renderer/core/style/computed_style_extra_fields.json5
+index 923add6c35bc1..53adf058d6a8f 100644
+--- a/third_party/blink/renderer/core/style/computed_style_extra_fields.json5
++++ b/third_party/blink/renderer/core/style/computed_style_extra_fields.json5
+@@ -93,6 +93,16 @@
+       type_name: "bool",
+       inherited: true,
+     },
++    // [PoC] CSS Fingerprinting Defense: Tracks if privacy-sensitive media queries
++    // (prefers-color-scheme, prefers-reduced-motion, prefers-contrast,
++    // forced-colors, etc.) affected this style.
++    {
++      name: "AffectedByPrivacySensitiveMediaQuery",
++      field_template: "monotonic_flag",
++      default_value: "false",
++      reset_on_new_style: true,
++      custom_compare: true,
++    },
+     // Style has content property with attr() values.
+     {
+       name: "HasAttrContent",
